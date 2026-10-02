@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { createTLStore, Tldraw, type TLStoreWithStatus } from 'tldraw'
+import { createTLStore, Tldraw, type TLComponents, type TLStoreWithStatus } from 'tldraw'
+import { CustomStylePanel } from './CustomStylePanel'
+
+const components = {
+	StylePanel: CustomStylePanel,
+} satisfies TLComponents
 
 interface ChangeSet {
 	added: unknown[]
@@ -108,7 +113,7 @@ function App() {
 
 	return (
 		<div style={{ position: 'fixed', inset: 0 }}>
-			<Tldraw store={storeWithStatus} />
+			<Tldraw store={storeWithStatus} components={components} />
 		</div>
 	)
 }
