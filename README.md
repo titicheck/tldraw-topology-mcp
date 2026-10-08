@@ -4,9 +4,9 @@ A shared local tldraw topology service with a persistent HTTP daemon and a thin 
 
 ## Architecture
 
-- `daemon.mjs` owns the authoritative tldraw document store, persistence, browser/static HTTP service, synchronization API, page/view projections, health endpoint, and topology mutations.
-- `server.mjs` is a thin stdio MCP adapter. It exposes twelve tools and forwards requests to the daemon over HTTP.
-- The browser publishes ephemeral Human View state (current page, camera, viewport, selection, visible shapes, and a viewport PNG). This is a projection of the authoritative document, not a second data authority.
+- `daemon.mjs` owns the authoritative tldraw document store, persistence, browser/static HTTP service, synchronization API, page-scoped topology projections, health endpoint, and topology mutations.
+- `server.mjs` is a thin stdio MCP adapter. It exposes nine topology tools and forwards requests to the daemon over HTTP.
+- tldraw Pages are first-class MCP scope boundaries. Normal topology reads and page-targeted mutations operate on one explicit `page_id`.
 - The MCP adapter does not own the daemon lifecycle. MCP clients can connect and disconnect without destroying the shared canvas state.
 
 ## Install and build
@@ -30,27 +30,22 @@ npm run mcp
 
 ## MCP tools
 
-### Read surfaces
+### Page discovery and reads
 
-- `topology_get` — page-scoped topology by default; omit `page_id` to use the active browser page. Use `scope=document` only for an explicit cross-page document view.
-- `page_list` — list document pages and identify the page reported by the active browser view.
-- `page_get` — read one page as compact summaries or exact page-scoped tldraw records.
-- `view_get` — read the active browser page, camera, viewport, selection, visible shapes, and visible topology projection.
-- `view_snapshot` — return a PNG of the latest coherent active browser viewport plus matching view metadata.
+- `page_list` — list tldraw document pages with stable page IDs, names, order, and topology node/edge counts.
+- `topology_get(page_id)` — read the topology contained in exactly one page.
 
 ### Mutations
 
-- `node_add`, `node_update`, `node_delete`
-- `edge_add`, `edge_update`, `edge_delete`
-- `topology_clear`
+- `node_add(page_id, ...)` — add a topology node to exactly one page.
+- `node_update(id, ...)` / `node_delete(id)` — derive the owning page from the existing node.
+- `edge_add(from, to, ...)` — derive the page from the endpoints and reject cross-page edges.
+- `edge_update(id, ...)` / `edge_delete(id)` — derive the owning page from the existing edge.
+- `topology_clear(page_id)` — clear topology content from exactly one page while preserving the page and every other page.
 
-Page semantics are closed by default:
+Page identity is authoritative by `page_id`; page names are display metadata only. Shape ownership is resolved through the full tldraw parent ancestry, so shapes nested under frames or groups still belong to the correct page.
 
-- `node_add` targets an explicit `page_id` or the active browser page.
-- `edge_add` requires both endpoint nodes to belong to the same page; cross-page topology edges are rejected.
-- updates and deletes derive the owning page from the target shape identity.
-- `topology_clear` clears one explicit/current page by default; whole-document clear requires explicit `scope=document`.
-- if no active browser page is available, page-defaulting operations fail closed unless `page_id` is provided.
+There is intentionally no implicit "current browser page" fallback and no whole-document topology read/clear compatibility mode. Browser session state such as current page, camera, selection, viewport, and screenshots is a separate ephemeral View concern and is not part of this page-scoped MCP surface.
 
 ## Daemon configuration
 
@@ -75,19 +70,16 @@ The default bind is loopback. External interface exposure belongs to deployment 
 ## HTTP endpoints
 
 - `GET /healthz` — daemon health and current revision.
-- `GET /api/state` — complete authoritative tldraw document snapshot.
+- `GET /api/state` — complete authoritative tldraw document snapshot for synchronization/recovery.
 - `GET /api/changes?since=<revision>` — incremental browser synchronization.
 - `POST /api/changes` — browser document changes.
-- `GET /api/view` — latest eligible browser Human View metadata.
-- `POST /api/view` — publish browser Human View metadata and coherent viewport snapshot.
-- `DELETE /api/view?clientId=<id>` — unregister a browser view client.
-- `POST /api/topology/command` — semantic topology/page/view command endpoint used by the MCP adapter.
+- `POST /api/topology/command` — semantic page/topology command endpoint used by the MCP adapter.
+
+The complete `/api/state` document snapshot remains an internal synchronization/recovery surface. It is not the normal MCP topology read surface.
 
 ## Persistence and concurrency
 
 The daemon is the single writer for the authoritative local document. Runtime document state is stored in `data/store.json` by default and is intentionally excluded from source control. Writes use a temporary file followed by rename. Semantic mutations are serialized so multiple MCP adapters can safely share one daemon.
-
-Browser Human View state is intentionally ephemeral and in-memory. View snapshots are accepted only when their `viewToken` matches the latest visual/document state for that browser client, preventing an older image export from being paired with newer page/camera metadata.
 
 ## Service supervision
 
