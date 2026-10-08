@@ -61,6 +61,11 @@ let revision = 0
 let journal = []
 let mutationTail = Promise.resolve()
 
+const VIEW_ACTIVE_TTL_MS = 15_000
+const VIEW_BACKGROUND_TTL_MS = 90_000
+const VIEW_CLIENT_RETENTION_MS = 300_000
+const viewClients = new Map()
+
 function seedBlankStore() {
 	if (store.allRecords().length) return false
 	const pageId = PageRecordType.createId('page')
@@ -99,14 +104,9 @@ function serializeMutation(fn) {
 	return next
 }
 
-function pageId() {
-	const page = store.allRecords().find((r) => r.typeName === 'page')
-	if (!page) throw new Error('No tldraw page exists')
-	return page.id
-}
-
-function nextIndex() {
-	const shapes = store.allRecords().filter((r) => r.typeName === 'shape' && r.parentId === pageId())
+function nextIndex(targetPageId) {
+	pageRecordById(targetPageId)
+	const { shapes } = pageShapesAndBindings(targetPageId)
 	if (!shapes.length) return 'a1'
 	const last = shapes.map((s) => s.index).sort().at(-1)
 	return getIndexAbove(last)
@@ -142,6 +142,7 @@ async function commitUnsafe(changes) {
 	return event
 }
 
+
 function canServeSince(since) {
 	if (since === revision) return true
 	if (since > revision) return false
@@ -173,13 +174,93 @@ function shapeById(id) {
 	return shape
 }
 
+function pageIdForShape(shape) {
+	let parentId = shape.parentId
+	const seen = new Set()
+	while (typeof parentId === 'string' && !seen.has(parentId)) {
+		if (parentId.startsWith('page:')) {
+			pageRecordById(parentId)
+			return parentId
+		}
+		seen.add(parentId)
+		const parent = store.get(parentId)
+		if (!parent || parent.typeName !== 'shape') break
+		parentId = parent.parentId
+	}
+	throw new Error(`Shape is not attached to a tldraw page: ${shape.id}`)
+}
+
 function bindingsForArrow(arrowId) {
 	return store.allRecords().filter((r) => r.typeName === 'binding' && r.type === 'arrow' && r.fromId === arrowId)
 }
 
-function topologyView() {
+function pageRecordById(id) {
+	const page = store.get(id)
+	if (!page || page.typeName !== 'page') throw new Error(`Page not found: ${id}`)
+	return page
+}
+
+function pageRecords() {
+	return store.allRecords()
+		.filter((r) => r.typeName === 'page')
+		.sort((a, b) => String(a.index).localeCompare(String(b.index)))
+}
+
+function shapeBelongsToPage(shape, targetPageId, shapesById) {
+	let parentId = shape.parentId
+	const seen = new Set()
+	while (typeof parentId === 'string' && !seen.has(parentId)) {
+		if (parentId === targetPageId) return true
+		seen.add(parentId)
+		const parent = shapesById.get(parentId)
+		if (!parent) return false
+		parentId = parent.parentId
+	}
+	return false
+}
+
+function pageShapesAndBindings(targetPageId) {
 	const records = store.allRecords()
-	const shapes = records.filter((r) => r.typeName === 'shape')
+	const allShapes = records.filter((r) => r.typeName === 'shape')
+	const shapesById = new Map(allShapes.map((shape) => [shape.id, shape]))
+	const shapes = allShapes.filter((shape) => shapeBelongsToPage(shape, targetPageId, shapesById))
+	const shapeIds = new Set(shapes.map((shape) => shape.id))
+	const bindings = records.filter(
+		(r) => r.typeName === 'binding' && (shapeIds.has(r.fromId) || shapeIds.has(r.toId)),
+	)
+	return { shapes, bindings }
+}
+
+function shapeSummary(shape) {
+	return {
+		id: shape.id,
+		type: shape.type,
+		parentId: shape.parentId,
+		index: shape.index,
+		x: shape.x,
+		y: shape.y,
+		rotation: shape.rotation ?? 0,
+		w: shape.props?.w ?? null,
+		h: shape.props?.h ?? null,
+		label: plainText(shape.props?.richText),
+		color: shape.props?.color ?? null,
+		labelColor: shape.props?.labelColor ?? null,
+	}
+}
+
+function bindingSummary(binding) {
+	return {
+		id: binding.id,
+		type: binding.type,
+		fromId: binding.fromId,
+		toId: binding.toId,
+		props: binding.props,
+	}
+}
+
+function topologyForPage(targetPageId) {
+	const { shapes } = pageShapesAndBindings(targetPageId)
+	const pageShapeIds = new Set(shapes.map((shape) => shape.id))
 	const nodes = shapes.filter((s) => s.type === 'geo').map((s) => ({
 		id: s.id,
 		label: plainText(s.props?.richText),
@@ -195,32 +276,311 @@ function topologyView() {
 		const end = bs.find((b) => b.props?.terminal === 'end')
 		return {
 			id: s.id,
+			from: pageShapeIds.has(start?.toId) ? start.toId : null,
+			to: pageShapeIds.has(end?.toId) ? end.toId : null,
+			label: plainText(s.props?.richText),
+		}
+	})
+	return { nodes, edges }
+}
+
+function pageProjection(targetPageId, detail = 'summary') {
+	const page = pageRecordById(targetPageId)
+	const { shapes, bindings } = pageShapesAndBindings(targetPageId)
+	return {
+		page: { id: page.id, name: page.name, index: page.index },
+		shapeCount: shapes.length,
+		bindingCount: bindings.length,
+		shapes: detail === 'records' ? shapes : shapes.map(shapeSummary),
+		bindings: detail === 'records' ? bindings : bindings.map(bindingSummary),
+		topology: topologyForPage(targetPageId),
+	}
+}
+
+function pruneViewClients(now = Date.now()) {
+	for (const [clientId, view] of viewClients) {
+		if (now - view.updatedAt > VIEW_CLIENT_RETENTION_MS) viewClients.delete(clientId)
+	}
+}
+
+function currentViewClient() {
+	const now = Date.now()
+	pruneViewClients(now)
+	const live = [...viewClients.values()].filter((view) => {
+		const age = now - view.updatedAt
+		return age <= (view.active ? VIEW_ACTIVE_TTL_MS : VIEW_BACKGROUND_TTL_MS)
+	})
+	if (!live.length) return null
+	live.sort((a, b) => {
+		if (a.active !== b.active) return a.active ? -1 : 1
+		return b.updatedAt - a.updatedAt
+	})
+	return live[0]
+}
+
+function finiteNumber(value, name) {
+	if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} must be a finite number`)
+	return value
+}
+
+function normalizeBox(value, name) {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${name} is required`)
+	return {
+		x: finiteNumber(value.x, `${name}.x`),
+		y: finiteNumber(value.y, `${name}.y`),
+		w: finiteNumber(value.w, `${name}.w`),
+		h: finiteNumber(value.h, `${name}.h`),
+	}
+}
+
+function normalizeStringArray(value) {
+	if (!Array.isArray(value)) return []
+	return [...new Set(value.filter((item) => typeof item === 'string' && item))]
+}
+
+function normalizeSnapshot(value) {
+	if (value === undefined) return undefined
+	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('snapshot must be an object')
+	if (value.mimeType !== 'image/png') throw new Error('snapshot.mimeType must be image/png')
+	if (typeof value.data !== 'string' || !value.data) throw new Error('snapshot.data is required')
+	if (value.data.length > 12 * 1024 * 1024) throw new Error('snapshot.data is too large')
+	const width = finiteNumber(value.width, 'snapshot.width')
+	const height = finiteNumber(value.height, 'snapshot.height')
+	if (width <= 0 || height <= 0 || width > 10000 || height > 10000) throw new Error('snapshot dimensions are invalid')
+	return { mimeType: value.mimeType, data: value.data, width, height }
+}
+
+function normalizeViewPayload(body) {
+	if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('View payload is required')
+	if (typeof body.clientId !== 'string' || !body.clientId) throw new Error('clientId is required')
+	if (!Number.isInteger(body.viewToken) || body.viewToken < 0) throw new Error('viewToken must be a non-negative integer')
+	if (typeof body.pageId !== 'string' || !body.pageId) throw new Error('pageId is required')
+	const page = pageRecordById(body.pageId)
+	if (!body.camera || typeof body.camera !== 'object' || Array.isArray(body.camera)) throw new Error('camera is required')
+	const snapshot = normalizeSnapshot(body.snapshot)
+	return {
+		clientId: body.clientId,
+		viewToken: body.viewToken,
+		active: body.active === true,
+		pageId: page.id,
+		pageName: typeof body.pageName === 'string' && body.pageName ? body.pageName : page.name,
+		camera: {
+			x: finiteNumber(body.camera.x, 'camera.x'),
+			y: finiteNumber(body.camera.y, 'camera.y'),
+			z: finiteNumber(body.camera.z, 'camera.z'),
+		},
+		viewport: {
+			pageBounds: normalizeBox(body.viewport?.pageBounds, 'viewport.pageBounds'),
+			screenBounds: normalizeBox(body.viewport?.screenBounds, 'viewport.screenBounds'),
+		},
+		selectedShapeIds: normalizeStringArray(body.selectedShapeIds),
+		visibleShapeIds: normalizeStringArray(body.visibleShapeIds),
+		snapshot,
+		snapshotError: typeof body.snapshotError === 'string' ? body.snapshotError : undefined,
+	}
+}
+
+function updateViewClient(body) {
+	const next = normalizeViewPayload(body)
+	const now = Date.now()
+	const previous = viewClients.get(next.clientId)
+	const sameViewToken = previous?.viewToken === next.viewToken
+	const snapshot = next.snapshot ?? (sameViewToken ? previous?.snapshot ?? null : null)
+	const snapshotCapturedAt = next.snapshot
+		? now
+		: sameViewToken
+			? previous?.snapshotCapturedAt ?? null
+			: null
+	const stored = {
+		...next,
+		snapshot,
+		snapshotViewToken: next.snapshot ? next.viewToken : (sameViewToken ? previous?.snapshotViewToken ?? null : null),
+		snapshotCapturedAt,
+		updatedAt: now,
+	}
+	viewClients.set(stored.clientId, stored)
+	pruneViewClients(now)
+	return {
+		ok: true,
+		clientId: stored.clientId,
+		pageId: stored.pageId,
+		viewToken: stored.viewToken,
+		updatedAt: stored.updatedAt,
+		snapshotAvailable: !!stored.snapshot && stored.snapshotViewToken === stored.viewToken,
+	}
+}
+
+function removeViewClient(clientId) {
+	if (typeof clientId !== 'string' || !clientId) return false
+	return viewClients.delete(clientId)
+}
+
+function viewClientPublic(view, { includeSnapshot = false } = {}) {
+	if (!view) return null
+	const result = {
+		clientId: view.clientId,
+		viewToken: view.viewToken,
+		active: view.active,
+		pageId: view.pageId,
+		pageName: view.pageName,
+		camera: view.camera,
+		viewport: view.viewport,
+		selectedShapeIds: view.selectedShapeIds,
+		visibleShapeIds: view.visibleShapeIds,
+		updatedAt: view.updatedAt,
+		ageMs: Math.max(0, Date.now() - view.updatedAt),
+		snapshotAvailable: !!view.snapshot && view.snapshotViewToken === view.viewToken,
+		snapshotViewToken: view.snapshotViewToken,
+		snapshotCapturedAt: view.snapshotCapturedAt,
+		snapshotError: view.snapshotError ?? null,
+	}
+	if (includeSnapshot) result.snapshot = view.snapshot
+	return result
+}
+
+function pageListView() {
+	const current = currentViewClient()
+	const counts = new Map()
+	for (const page of pageRecords()) counts.set(page.id, pageShapesAndBindings(page.id).shapes.length)
+	return {
+		revision,
+		currentPageId: current?.pageId ?? null,
+		viewAvailable: !!current,
+		pages: pageRecords().map((page) => ({
+			id: page.id,
+			name: page.name,
+			index: page.index,
+			shapeCount: counts.get(page.id) ?? 0,
+			isCurrent: page.id === current?.pageId,
+		})),
+		url: CANVAS_URL,
+	}
+}
+
+function resolvePageId(requestedPageId) {
+	if (typeof requestedPageId === 'string' && requestedPageId) {
+		pageRecordById(requestedPageId)
+		return requestedPageId
+	}
+	const current = currentViewClient()
+	if (!current) throw new Error('Current tldraw browser page is unavailable; open the canvas or provide page_id explicitly')
+	return current.pageId
+}
+
+function viewGet() {
+	const view = currentViewClient()
+	if (!view) return { available: false, revision, url: CANVAS_URL }
+	const projection = pageProjection(view.pageId, 'summary')
+	const visibleIds = new Set(view.visibleShapeIds)
+	const selectedIds = new Set(view.selectedShapeIds)
+	return {
+		available: true,
+		revision,
+		url: CANVAS_URL,
+		view: viewClientPublic(view),
+		visibleShapes: projection.shapes.filter((shape) => visibleIds.has(shape.id)),
+		selectedShapes: projection.shapes.filter((shape) => selectedIds.has(shape.id)),
+		visibleTopology: {
+			nodes: projection.topology.nodes.filter((node) => visibleIds.has(node.id)),
+			edges: projection.topology.edges.filter((edge) => visibleIds.has(edge.id)),
+		},
+	}
+}
+
+function viewSnapshot() {
+	const view = currentViewClient()
+	if (!view) throw new Error('Current tldraw browser view is unavailable')
+	if (!view.snapshot || view.snapshotViewToken !== view.viewToken) {
+		const detail = view.snapshotError ? `: ${view.snapshotError}` : ''
+		throw new Error(`Current tldraw browser snapshot is unavailable for the latest view${detail}`)
+	}
+	return {
+		mimeType: view.snapshot.mimeType,
+		data: view.snapshot.data,
+		width: view.snapshot.width,
+		height: view.snapshot.height,
+		pageId: view.pageId,
+		pageName: view.pageName,
+		clientId: view.clientId,
+		viewToken: view.viewToken,
+		capturedAt: view.snapshotCapturedAt,
+		ageMs: Math.max(0, Date.now() - view.snapshotCapturedAt),
+		viewport: view.viewport,
+		selectedShapeIds: view.selectedShapeIds,
+	}
+}
+
+function documentTopologyView() {
+	const records = store.allRecords()
+	const shapes = records.filter((r) => r.typeName === 'shape')
+	const nodes = shapes.filter((s) => s.type === 'geo').map((s) => ({
+		id: s.id,
+		pageId: pageIdForShape(s),
+		label: plainText(s.props?.richText),
+		x: s.x,
+		y: s.y,
+		w: s.props?.w ?? 100,
+		h: s.props?.h ?? 100,
+		geo: s.props?.geo ?? 'rectangle',
+	}))
+	const edges = shapes.filter((s) => s.type === 'arrow').map((s) => {
+		const bs = bindingsForArrow(s.id)
+		const start = bs.find((b) => b.props?.terminal === 'start')
+		const end = bs.find((b) => b.props?.terminal === 'end')
+		return {
+			id: s.id,
+			pageId: pageIdForShape(s),
 			from: start?.toId ?? null,
 			to: end?.toId ?? null,
 			label: plainText(s.props?.richText),
 		}
 	})
-	return { revision, nodes, edges, url: CANVAS_URL }
+	return {
+		revision,
+		scope: 'document',
+		pages: pageRecords().map((page) => ({ id: page.id, name: page.name, index: page.index })),
+		nodes,
+		edges,
+		url: CANVAS_URL,
+	}
 }
 
-async function addNode({ label, x = 100, y = 100, w = 240, h = 100 }) {
+function topologyView(args = {}) {
+	if (args.scope === 'document') {
+		if (args.page_id !== undefined) throw new Error('page_id cannot be combined with scope=document')
+		return documentTopologyView()
+	}
+	const targetPageId = resolvePageId(args.page_id)
+	const page = pageRecordById(targetPageId)
+	return {
+		revision,
+		scope: 'page',
+		page: { id: page.id, name: page.name, index: page.index },
+		...topologyForPage(targetPageId),
+		url: CANVAS_URL,
+	}
+}
+
+async function addNode({ label, page_id, x = 100, y = 100, w = 240, h = 100 }) {
+	const targetPageId = resolvePageId(page_id)
 	const id = createShapeId(`node-${randomUUID()}`)
 	const record = store.schema.types.shape.create({
 		id,
 		type: 'geo',
-		parentId: pageId(),
-		index: nextIndex(),
+		parentId: targetPageId,
+		index: nextIndex(targetPageId),
 		x,
 		y,
 		props: { ...GEO_DEFAULTS, w, h, richText: toRichText(label) },
 	})
 	await commitUnsafe({ added: [record] })
-	return { id, revision }
+	return { id, pageId: targetPageId, revision }
 }
 
 async function updateNode({ id, label, x, y, w, h }) {
 	const node = shapeById(id)
 	if (node.type !== 'geo') throw new Error(`${node.id} is not a topology node`)
+	const targetPageId = pageIdForShape(node)
 	const next = {
 		...node,
 		x: x ?? node.x,
@@ -233,19 +593,22 @@ async function updateNode({ id, label, x, y, w, h }) {
 		},
 	}
 	await commitUnsafe({ updated: [next] })
-	return { id: node.id, revision }
+	return { id: node.id, pageId: targetPageId, revision }
 }
 
 async function deleteEdgeById(edgeId) {
 	const edge = shapeById(edgeId)
 	if (edge.type !== 'arrow') throw new Error(`${edge.id} is not a topology edge`)
+	const targetPageId = pageIdForShape(edge)
 	const bindings = bindingsForArrow(edge.id)
 	await commitUnsafe({ removed: [edge.id, ...bindings.map((b) => b.id)] })
+	return { id: edge.id, pageId: targetPageId, revision }
 }
 
 async function deleteNode({ id }) {
 	const node = shapeById(id)
 	if (node.type !== 'geo') throw new Error(`${node.id} is not a topology node`)
+	const targetPageId = pageIdForShape(node)
 	const connectedBindings = store.allRecords().filter(
 		(r) => r.typeName === 'binding' && r.type === 'arrow' && r.toId === node.id,
 	)
@@ -255,13 +618,23 @@ async function deleteNode({ id }) {
 		removed.push(edgeId, ...bindingsForArrow(edgeId).map((b) => b.id))
 	}
 	await commitUnsafe({ removed: [...new Set(removed)] })
-	return { id: node.id, removedEdges: edgeIds, revision }
+	return { id: node.id, pageId: targetPageId, removedEdges: edgeIds, revision }
 }
 
-async function addEdge({ from, to, label = '' }) {
+async function addEdge({ from, to, page_id, label = '' }) {
 	const fromNode = shapeById(from)
 	const toNode = shapeById(to)
 	if (fromNode.type !== 'geo' || toNode.type !== 'geo') throw new Error('Edges must connect topology nodes')
+	const fromPageId = pageIdForShape(fromNode)
+	const toPageId = pageIdForShape(toNode)
+	if (fromPageId !== toPageId) throw new Error(`Cross-page topology edges are not allowed: ${fromPageId} -> ${toPageId}`)
+	if (page_id !== undefined) {
+		const requestedPageId = resolvePageId(page_id)
+		if (requestedPageId !== fromPageId) {
+			throw new Error(`page_id does not own both endpoint nodes: requested ${requestedPageId}, endpoints ${fromPageId}`)
+		}
+	}
+	const targetPageId = fromPageId
 	const edgeId = createShapeId(`edge-${randomUUID()}`)
 	const startX = fromNode.x + (fromNode.props?.w ?? 100) / 2
 	const startY = fromNode.y + (fromNode.props?.h ?? 100) / 2
@@ -270,8 +643,8 @@ async function addEdge({ from, to, label = '' }) {
 	const arrow = store.schema.types.shape.create({
 		id: edgeId,
 		type: 'arrow',
-		parentId: pageId(),
-		index: nextIndex(),
+		parentId: targetPageId,
+		index: nextIndex(targetPageId),
 		x: startX,
 		y: startY,
 		props: {
@@ -292,29 +665,56 @@ async function addEdge({ from, to, label = '' }) {
 		props: { ...BINDING_DEFAULTS, terminal: 'end' },
 	})
 	await commitUnsafe({ added: [arrow, startBinding, endBinding] })
-	return { id: edgeId, from: fromNode.id, to: toNode.id, revision }
+	return { id: edgeId, pageId: targetPageId, from: fromNode.id, to: toNode.id, revision }
 }
 
 async function updateEdge({ id, label }) {
 	const edge = shapeById(id)
 	if (edge.type !== 'arrow') throw new Error(`${edge.id} is not a topology edge`)
+	const targetPageId = pageIdForShape(edge)
 	const next = { ...edge, props: { ...edge.props, richText: toRichText(label) } }
 	await commitUnsafe({ updated: [next] })
-	return { id: edge.id, revision }
+	return { id: edge.id, pageId: targetPageId, revision }
 }
 
-async function clearTopology() {
-	const removed = store.allRecords()
-		.filter((r) => r.typeName === 'shape' || r.typeName === 'binding')
-		.map((r) => r.id)
+async function clearTopology({ page_id, scope = 'current_page' } = {}) {
+	if (scope === 'document') {
+		if (page_id !== undefined) throw new Error('page_id cannot be combined with scope=document')
+		const removed = store.allRecords()
+			.filter((r) => r.typeName === 'shape' || r.typeName === 'binding')
+			.map((r) => r.id)
+		if (removed.length) await commitUnsafe({ removed })
+		return { scope: 'document', removed: removed.length, revision }
+	}
+	const targetPageId = resolvePageId(page_id)
+	const { shapes, bindings } = pageShapesAndBindings(targetPageId)
+	const removed = [...new Set([...shapes.map((r) => r.id), ...bindings.map((r) => r.id)])]
 	if (removed.length) await commitUnsafe({ removed })
-	return { removed: removed.length, revision }
+	return { scope: 'page', pageId: targetPageId, removed: removed.length, revision }
 }
 
 async function topologyCommand(name, args = {}) {
 	if (name === 'topology_get') {
 		await mutationTail
-		return topologyView()
+		return topologyView(args)
+	}
+	if (name === 'page_list') {
+		await mutationTail
+		return pageListView()
+	}
+	if (name === 'page_get') {
+		await mutationTail
+		const detail = args.detail === 'records' ? 'records' : 'summary'
+		const targetPageId = resolvePageId(args.page_id)
+		return { revision, url: CANVAS_URL, ...pageProjection(targetPageId, detail) }
+	}
+	if (name === 'view_get') {
+		await mutationTail
+		return viewGet()
+	}
+	if (name === 'view_snapshot') {
+		await mutationTail
+		return viewSnapshot()
 	}
 	return serializeMutation(async () => {
 		switch (name) {
@@ -323,12 +723,8 @@ async function topologyCommand(name, args = {}) {
 			case 'node_delete': return deleteNode(args)
 			case 'edge_add': return addEdge(args)
 			case 'edge_update': return updateEdge(args)
-			case 'edge_delete': {
-				const id = args.id
-				await deleteEdgeById(id)
-				return { id: id.startsWith('shape:') ? id : `shape:${id}`, revision }
-			}
-			case 'topology_clear': return clearTopology()
+			case 'edge_delete': return deleteEdgeById(args.id)
+			case 'topology_clear': return clearTopology(args)
 			default: throw new Error(`Unknown topology command: ${name}`)
 		}
 	})
@@ -349,7 +745,7 @@ async function readJson(req) {
 	let size = 0
 	for await (const chunk of req) {
 		size += chunk.length
-		if (size > 10 * 1024 * 1024) throw new Error('Request body too large')
+		if (size > 16 * 1024 * 1024) throw new Error('Request body too large')
 		chunks.push(chunk)
 	}
 	return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
@@ -395,6 +791,24 @@ const httpServer = createServer(async (req, res) => {
 		}
 		if (req.method === 'GET' && url.pathname === '/api/state') {
 			return json(res, 200, currentState())
+		}
+		if (req.method === 'GET' && url.pathname === '/api/view') {
+			const view = currentViewClient()
+			return json(res, 200, {
+				revision,
+				available: !!view,
+				view: viewClientPublic(view),
+				url: CANVAS_URL,
+			})
+		}
+		if (req.method === 'POST' && url.pathname === '/api/view') {
+			const body = await readJson(req)
+			return json(res, 200, updateViewClient(body))
+		}
+		if (req.method === 'DELETE' && url.pathname === '/api/view') {
+			const clientId = url.searchParams.get('clientId')
+			if (!clientId) return json(res, 400, { error: 'clientId is required' })
+			return json(res, 200, { ok: true, removed: removeViewClient(clientId) })
 		}
 		if (req.method === 'GET' && url.pathname === '/api/changes') {
 			const since = Number(url.searchParams.get('since') ?? revision)

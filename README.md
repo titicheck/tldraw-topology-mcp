@@ -4,8 +4,9 @@ A shared local tldraw topology service with a persistent HTTP daemon and a thin 
 
 ## Architecture
 
-- `daemon.mjs` owns the tldraw store, persistence, browser/static HTTP service, sync API, health endpoint, and topology mutations.
-- `server.mjs` is a thin stdio MCP adapter. It exposes eight topology tools and forwards calls to the daemon over HTTP.
+- `daemon.mjs` owns the authoritative tldraw document store, persistence, browser/static HTTP service, synchronization API, page/view projections, health endpoint, and topology mutations.
+- `server.mjs` is a thin stdio MCP adapter. It exposes twelve tools and forwards requests to the daemon over HTTP.
+- The browser publishes ephemeral Human View state (current page, camera, viewport, selection, visible shapes, and a viewport PNG). This is a projection of the authoritative document, not a second data authority.
 - The MCP adapter does not own the daemon lifecycle. MCP clients can connect and disconnect without destroying the shared canvas state.
 
 ## Install and build
@@ -29,7 +30,27 @@ npm run mcp
 
 ## MCP tools
 
-`topology_get`, `node_add`, `node_update`, `node_delete`, `edge_add`, `edge_update`, `edge_delete`, `topology_clear`.
+### Read surfaces
+
+- `topology_get` — page-scoped topology by default; omit `page_id` to use the active browser page. Use `scope=document` only for an explicit cross-page document view.
+- `page_list` — list document pages and identify the page reported by the active browser view.
+- `page_get` — read one page as compact summaries or exact page-scoped tldraw records.
+- `view_get` — read the active browser page, camera, viewport, selection, visible shapes, and visible topology projection.
+- `view_snapshot` — return a PNG of the latest coherent active browser viewport plus matching view metadata.
+
+### Mutations
+
+- `node_add`, `node_update`, `node_delete`
+- `edge_add`, `edge_update`, `edge_delete`
+- `topology_clear`
+
+Page semantics are closed by default:
+
+- `node_add` targets an explicit `page_id` or the active browser page.
+- `edge_add` requires both endpoint nodes to belong to the same page; cross-page topology edges are rejected.
+- updates and deletes derive the owning page from the target shape identity.
+- `topology_clear` clears one explicit/current page by default; whole-document clear requires explicit `scope=document`.
+- if no active browser page is available, page-defaulting operations fail closed unless `page_id` is provided.
 
 ## Daemon configuration
 
@@ -54,14 +75,19 @@ The default bind is loopback. External interface exposure belongs to deployment 
 ## HTTP endpoints
 
 - `GET /healthz` — daemon health and current revision.
-- `GET /api/state` — complete tldraw document snapshot.
+- `GET /api/state` — complete authoritative tldraw document snapshot.
 - `GET /api/changes?since=<revision>` — incremental browser synchronization.
 - `POST /api/changes` — browser document changes.
-- `POST /api/topology/command` — semantic topology command endpoint used by the MCP adapter.
+- `GET /api/view` — latest eligible browser Human View metadata.
+- `POST /api/view` — publish browser Human View metadata and coherent viewport snapshot.
+- `DELETE /api/view?clientId=<id>` — unregister a browser view client.
+- `POST /api/topology/command` — semantic topology/page/view command endpoint used by the MCP adapter.
 
 ## Persistence and concurrency
 
-The daemon is the single writer for the authoritative local document. Runtime state is stored in `data/store.json` by default and is intentionally excluded from source control. Writes use a temporary file followed by rename. Semantic mutations are serialized so multiple MCP adapters can safely share one daemon.
+The daemon is the single writer for the authoritative local document. Runtime document state is stored in `data/store.json` by default and is intentionally excluded from source control. Writes use a temporary file followed by rename. Semantic mutations are serialized so multiple MCP adapters can safely share one daemon.
+
+Browser Human View state is intentionally ephemeral and in-memory. View snapshots are accepted only when their `viewToken` matches the latest visual/document state for that browser client, preventing an older image export from being paired with newer page/camera metadata.
 
 ## Service supervision
 
