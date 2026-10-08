@@ -61,11 +61,6 @@ let revision = 0
 let journal = []
 let mutationTail = Promise.resolve()
 
-const VIEW_ACTIVE_TTL_MS = 15_000
-const VIEW_BACKGROUND_TTL_MS = 90_000
-const VIEW_CLIENT_RETENTION_MS = 300_000
-const viewClients = new Map()
-
 
 function seedBlankStore() {
 	if (store.allRecords().length) return false
@@ -258,223 +253,6 @@ function topologyForPage(targetPageId) {
 	return { nodes, edges }
 }
 
-function shapeSummary(shape) {
-	return {
-		id: shape.id,
-		type: shape.type,
-		parentId: shape.parentId,
-		index: shape.index,
-		x: shape.x,
-		y: shape.y,
-		rotation: shape.rotation ?? 0,
-		w: shape.props?.w ?? null,
-		h: shape.props?.h ?? null,
-		label: plainText(shape.props?.richText),
-		color: shape.props?.color ?? null,
-		labelColor: shape.props?.labelColor ?? null,
-	}
-}
-
-function pruneViewClients(now = Date.now()) {
-	for (const [viewId, view] of viewClients) {
-		if (now - view.updatedAt > VIEW_CLIENT_RETENTION_MS) viewClients.delete(viewId)
-	}
-}
-
-function viewIsLive(view, now = Date.now()) {
-	const age = now - view.updatedAt
-	return age <= (view.active ? VIEW_ACTIVE_TTL_MS : VIEW_BACKGROUND_TTL_MS)
-}
-
-function liveViewClients() {
-	const now = Date.now()
-	pruneViewClients(now)
-	return [...viewClients.values()]
-		.filter((view) => viewIsLive(view, now))
-		.sort((a, b) => {
-			if (a.active !== b.active) return a.active ? -1 : 1
-			return b.updatedAt - a.updatedAt
-		})
-}
-
-function viewClientById(viewId) {
-	if (typeof viewId !== 'string' || !viewId) throw new Error('view_id is required')
-	pruneViewClients()
-	const view = viewClients.get(viewId)
-	if (!view || !viewIsLive(view)) throw new Error(`View not found or stale: ${viewId}`)
-	return view
-}
-
-function finiteNumber(value, name) {
-	if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} must be a finite number`)
-	return value
-}
-
-function normalizeBox(value, name) {
-	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${name} is required`)
-	return {
-		x: finiteNumber(value.x, `${name}.x`),
-		y: finiteNumber(value.y, `${name}.y`),
-		w: finiteNumber(value.w, `${name}.w`),
-		h: finiteNumber(value.h, `${name}.h`),
-	}
-}
-
-function normalizeStringArray(value) {
-	if (!Array.isArray(value)) return []
-	return [...new Set(value.filter((item) => typeof item === 'string' && item))]
-}
-
-function normalizeSnapshot(value) {
-	if (value === undefined) return undefined
-	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('snapshot must be an object')
-	if (value.mimeType !== 'image/png') throw new Error('snapshot.mimeType must be image/png')
-	if (typeof value.data !== 'string' || !value.data) throw new Error('snapshot.data is required')
-	if (value.data.length > 12 * 1024 * 1024) throw new Error('snapshot.data is too large')
-	const width = finiteNumber(value.width, 'snapshot.width')
-	const height = finiteNumber(value.height, 'snapshot.height')
-	if (width <= 0 || height <= 0 || width > 10000 || height > 10000) throw new Error('snapshot dimensions are invalid')
-	return { mimeType: value.mimeType, data: value.data, width, height }
-}
-
-function normalizeViewPayload(body) {
-	if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('View payload is required')
-	if (typeof body.viewId !== 'string' || !body.viewId) throw new Error('viewId is required')
-	if (!Number.isInteger(body.viewToken) || body.viewToken < 0) throw new Error('viewToken must be a non-negative integer')
-	if (typeof body.pageId !== 'string' || !body.pageId) throw new Error('pageId is required')
-	const page = pageRecordById(body.pageId)
-	if (!body.camera || typeof body.camera !== 'object' || Array.isArray(body.camera)) throw new Error('camera is required')
-	const snapshot = normalizeSnapshot(body.snapshot)
-	return {
-		viewId: body.viewId,
-		viewToken: body.viewToken,
-		active: body.active === true,
-		pageId: page.id,
-		pageName: typeof body.pageName === 'string' && body.pageName ? body.pageName : page.name,
-		camera: {
-			x: finiteNumber(body.camera.x, 'camera.x'),
-			y: finiteNumber(body.camera.y, 'camera.y'),
-			z: finiteNumber(body.camera.z, 'camera.z'),
-		},
-		viewport: {
-			pageBounds: normalizeBox(body.viewport?.pageBounds, 'viewport.pageBounds'),
-			screenBounds: normalizeBox(body.viewport?.screenBounds, 'viewport.screenBounds'),
-		},
-		selectedShapeIds: normalizeStringArray(body.selectedShapeIds),
-		visibleShapeIds: normalizeStringArray(body.visibleShapeIds),
-		snapshot,
-		snapshotError: typeof body.snapshotError === 'string' ? body.snapshotError : undefined,
-	}
-}
-
-function updateViewClient(body) {
-	const next = normalizeViewPayload(body)
-	const now = Date.now()
-	const previous = viewClients.get(next.viewId)
-	const sameViewToken = previous?.viewToken === next.viewToken
-	const snapshot = next.snapshot ?? (sameViewToken ? previous?.snapshot ?? null : null)
-	const snapshotCapturedAt = next.snapshot
-		? now
-		: sameViewToken
-			? previous?.snapshotCapturedAt ?? null
-			: null
-	const stored = {
-		...next,
-		snapshot,
-		snapshotViewToken: next.snapshot ? next.viewToken : (sameViewToken ? previous?.snapshotViewToken ?? null : null),
-		snapshotCapturedAt,
-		updatedAt: now,
-	}
-	viewClients.set(stored.viewId, stored)
-	pruneViewClients(now)
-	return {
-		ok: true,
-		viewId: stored.viewId,
-		pageId: stored.pageId,
-		viewToken: stored.viewToken,
-		updatedAt: stored.updatedAt,
-		snapshotAvailable: !!stored.snapshot && stored.snapshotViewToken === stored.viewToken,
-	}
-}
-
-function removeViewClient(viewId) {
-	if (typeof viewId !== 'string' || !viewId) return false
-	return viewClients.delete(viewId)
-}
-
-function viewClientPublic(view, { includeShapeIds = true } = {}) {
-	const result = {
-		id: view.viewId,
-		viewToken: view.viewToken,
-		active: view.active,
-		page: { id: view.pageId, name: view.pageName },
-		camera: view.camera,
-		viewport: view.viewport,
-		selectedShapeCount: view.selectedShapeIds.length,
-		visibleShapeCount: view.visibleShapeIds.length,
-		updatedAt: view.updatedAt,
-		ageMs: Math.max(0, Date.now() - view.updatedAt),
-		snapshotAvailable: !!view.snapshot && view.snapshotViewToken === view.viewToken,
-		snapshotCapturedAt: view.snapshotCapturedAt,
-		snapshotError: view.snapshotError ?? null,
-	}
-	if (includeShapeIds) {
-		result.selectedShapeIds = view.selectedShapeIds
-		result.visibleShapeIds = view.visibleShapeIds
-	}
-	return result
-}
-
-function viewListView() {
-	return {
-		revision,
-		views: liveViewClients().map((view) => viewClientPublic(view, { includeShapeIds: false })),
-		url: CANVAS_URL,
-	}
-}
-
-function viewGet({ view_id }) {
-	const view = viewClientById(view_id)
-	const { shapes } = pageShapesAndBindings(view.pageId)
-	const summaries = shapes.map(shapeSummary)
-	const visibleIds = new Set(view.visibleShapeIds)
-	const selectedIds = new Set(view.selectedShapeIds)
-	const topology = topologyForPage(view.pageId)
-	return {
-		revision,
-		url: CANVAS_URL,
-		view: viewClientPublic(view),
-		visibleShapes: summaries.filter((shape) => visibleIds.has(shape.id)),
-		selectedShapes: summaries.filter((shape) => selectedIds.has(shape.id)),
-		visibleTopology: {
-			nodes: topology.nodes.filter((node) => visibleIds.has(node.id)),
-			edges: topology.edges.filter((edge) => visibleIds.has(edge.id)),
-		},
-	}
-}
-
-function viewSnapshot({ view_id }) {
-	const view = viewClientById(view_id)
-	if (!view.snapshot || view.snapshotViewToken !== view.viewToken) {
-		const detail = view.snapshotError ? `: ${view.snapshotError}` : ''
-		throw new Error(`Snapshot unavailable for latest view ${view.viewId}${detail}`)
-	}
-	return {
-		mimeType: view.snapshot.mimeType,
-		data: view.snapshot.data,
-		width: view.snapshot.width,
-		height: view.snapshot.height,
-		viewId: view.viewId,
-		viewToken: view.viewToken,
-		pageId: view.pageId,
-		pageName: view.pageName,
-		capturedAt: view.snapshotCapturedAt,
-		ageMs: Math.max(0, Date.now() - view.snapshotCapturedAt),
-		viewport: view.viewport,
-		selectedShapeIds: view.selectedShapeIds,
-	}
-}
-
 function pageListView() {
 	return {
 		revision,
@@ -648,18 +426,6 @@ async function topologyCommand(name, args = {}) {
 		await mutationTail
 		return pageListView()
 	}
-	if (name === 'view_list') {
-		await mutationTail
-		return viewListView()
-	}
-	if (name === 'view_get') {
-		await mutationTail
-		return viewGet(args)
-	}
-	if (name === 'view_snapshot') {
-		await mutationTail
-		return viewSnapshot(args)
-	}
 	return serializeMutation(async () => {
 		switch (name) {
 			case 'node_add': return addNode(args)
@@ -735,15 +501,6 @@ const httpServer = createServer(async (req, res) => {
 		}
 		if (req.method === 'GET' && url.pathname === '/api/state') {
 			return json(res, 200, currentState())
-		}
-		if (req.method === 'POST' && url.pathname === '/api/view') {
-			const body = await readJson(req)
-			return json(res, 200, updateViewClient(body))
-		}
-		if (req.method === 'DELETE' && url.pathname === '/api/view') {
-			const viewId = url.searchParams.get('viewId')
-			if (!viewId) return json(res, 400, { error: 'viewId is required' })
-			return json(res, 200, { ok: true, removed: removeViewClient(viewId) })
 		}
 		if (req.method === 'GET' && url.pathname === '/api/changes') {
 			const since = Number(url.searchParams.get('since') ?? revision)

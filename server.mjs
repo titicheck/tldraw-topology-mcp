@@ -38,15 +38,6 @@ async function callDaemon(name, args = {}) {
 
 const mcp = new McpServer({ name: 'tldraw-topology', version: '0.1.0' })
 const textResult = (value) => ({ content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] })
-const imageResult = (value) => {
-	const { data, mimeType, ...metadata } = value
-	return {
-		content: [
-			{ type: 'image', data, mimeType },
-			{ type: 'text', text: JSON.stringify(metadata, null, 2) },
-		],
-	}
-}
 
 mcp.registerTool('page_list', {
 	description: 'List tldraw document pages with stable page IDs, names, order, and topology node/edge counts.',
@@ -59,25 +50,6 @@ mcp.registerTool('topology_get', {
 		page_id: z.string().min(1),
 	},
 }, async (args) => textResult(await callDaemon('topology_get', args)))
-
-mcp.registerTool('view_list', {
-	description: 'List live browser views of the shared tldraw canvas. Each view has an explicit view_id and its own page, camera, viewport, selection, and snapshot state.',
-	inputSchema: {},
-}, async () => textResult(await callDaemon('view_list')))
-
-mcp.registerTool('view_get', {
-	description: 'Read one explicit live browser view, including its page, camera, viewport, selection, visible shapes, and visible topology projection.',
-	inputSchema: {
-		view_id: z.string().min(1),
-	},
-}, async (args) => textResult(await callDaemon('view_get', args)))
-
-mcp.registerTool('view_snapshot', {
-	description: 'Return the latest coherent PNG rendering of one explicit live browser viewport plus matching metadata.',
-	inputSchema: {
-		view_id: z.string().min(1),
-	},
-}, async (args) => imageResult(await callDaemon('view_snapshot', args)))
 
 mcp.registerTool('node_add', {
 	description: 'Add a rectangular topology node to exactly one tldraw page.',

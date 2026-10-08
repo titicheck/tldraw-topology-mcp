@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createTLStore, Tldraw, type TLComponents, type TLStoreWithStatus } from 'tldraw'
 import { CustomStylePanel } from './CustomStylePanel'
-import { startViewBridge } from './ViewBridge'
 
 const components = {
 	StylePanel: CustomStylePanel,
@@ -114,7 +113,7 @@ function App() {
 
 	return (
 		<div style={{ position: 'fixed', inset: 0 }}>
-			<Tldraw store={storeWithStatus} components={components} onMount={startViewBridge} />
+			<Tldraw store={storeWithStatus} components={components} />
 		</div>
 	)
 }
