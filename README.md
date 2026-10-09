@@ -5,9 +5,10 @@ A shared local tldraw topology service with a persistent HTTP daemon and a thin 
 ## Architecture
 
 - `daemon.mjs` owns the authoritative tldraw document store, persistence, browser/static HTTP service, synchronization API, page-scoped topology projections, health endpoint, and topology mutations.
-- `server.mjs` is a thin stdio MCP adapter. It exposes nine page/topology tools and forwards requests to the daemon over HTTP.
-- tldraw Pages are first-class MCP scope boundaries. Normal topology reads and page-targeted mutations operate on one explicit `page_id`.
-- Geo nodes and Arrow edges expose their editable tldraw presentation properties through the same MCP tools; there is no separate style state plane.
+- `server.mjs` is a thin stdio MCP adapter. It exposes fourteen Page/topology/shape tools and forwards requests to the daemon over HTTP.
+- tldraw Pages are first-class MCP scope boundaries. Normal reads and Page-targeted mutations operate on one explicit `page_id`.
+- Geo nodes and Arrow edges retain the topology convenience tools, while a generic Shape layer exposes every built-in tldraw shape type through native records and props.
+- No parallel style state is introduced: MCP edits the same native tldraw properties used by the browser UI.
 - The MCP adapter does not own the daemon lifecycle. MCP clients can connect and disconnect without destroying the shared canvas state.
 
 ## Install and build
@@ -35,6 +36,26 @@ npm run mcp
 
 - `page_list` — list tldraw document pages with stable page IDs, names, order, and topology node/edge counts.
 - `topology_get(page_id)` — read exactly one Page. Geo nodes and Arrow edges include their editable presentation properties so writes can be verified through the same read surface.
+
+### Generic Shape editing
+
+The generic Shape layer keeps Page scoping and works on native tldraw records:
+
+- `shape_list(page_id, types?)` — list compact summaries for shapes belonging to one Page, including shapes nested under Frames or Groups.
+- `shape_get(id)` — return the complete native shape record plus owning `pageId`.
+- `shape_add(page_id, type, ...)` — create a built-in shape using tldraw-compatible defaults plus an optional native `props` override. `parent_id` may target the same Page or a container shape on that Page.
+- `shape_update(id, ...)` — patch base shape fields, metadata, native `props`, and rich-text content without changing the shape's type or Page ownership.
+- `shape_delete(id)` — delete a shape, its container descendants, and bindings/arrows that would otherwise reference deleted shapes.
+
+Supported built-in types:
+
+```text
+arrow bookmark draw embed frame geo group highlight image line note text video
+```
+
+For shapes with native `richText` (`geo`, `arrow`, `text`, `note`), generic add/update also accepts `text`, `bold`, `italic`, `bulletList`, and `highlight`. Low-level type-specific properties remain available through the native `props` object and are validated by the tldraw store schema.
+
+The topology tools below remain as convenient higher-level operations for Geo nodes and bound Arrow edges.
 
 ### Geo node editing
 

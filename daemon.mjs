@@ -78,6 +78,129 @@ const ARROWHEAD_VALUES = new Set([
 	'arrow', 'triangle', 'square', 'dot', 'pipe', 'diamond', 'inverted', 'bar', 'none',
 ])
 
+const DEFAULT_SHAPE_TYPES = new Set([
+	'arrow', 'bookmark', 'draw', 'embed', 'frame', 'geo', 'group',
+	'highlight', 'image', 'line', 'note', 'text', 'video',
+])
+
+function defaultPropsForShape(type) {
+	switch (type) {
+		case 'geo':
+			return { ...GEO_DEFAULTS, w: 100, h: 100 }
+		case 'arrow':
+			return structuredClone(ARROW_DEFAULTS)
+		case 'text':
+			return {
+				color: 'black',
+				size: 'm',
+				w: 8,
+				font: 'draw',
+				textAlign: 'start',
+				autoSize: true,
+				scale: 1,
+				richText: toRichText(''),
+			}
+		case 'note':
+			return {
+				color: 'black',
+				richText: toRichText(''),
+				size: 'm',
+				font: 'draw',
+				align: 'middle',
+				verticalAlign: 'middle',
+				labelColor: 'black',
+				growY: 0,
+				fontSizeAdjustment: 1,
+				url: '',
+				scale: 1,
+				textLastEditedBy: null,
+			}
+		case 'frame':
+			return { w: 320, h: 180, name: '', color: 'black' }
+		case 'group':
+			return {}
+		case 'draw':
+			return {
+				segments: [],
+				color: 'black',
+				fill: 'none',
+				dash: 'draw',
+				size: 'm',
+				isComplete: false,
+				isClosed: false,
+				isPen: false,
+				scale: 1,
+				scaleX: 1,
+				scaleY: 1,
+			}
+		case 'highlight':
+			return {
+				segments: [],
+				color: 'black',
+				size: 'm',
+				isComplete: false,
+				isPen: false,
+				scale: 1,
+				scaleX: 1,
+				scaleY: 1,
+			}
+		case 'line': {
+			const start = 'a1'
+			const end = getIndexAbove(start)
+			return {
+				dash: 'draw',
+				size: 'm',
+				color: 'black',
+				spline: 'line',
+				points: {
+					[start]: { id: start, index: start, x: 0, y: 0 },
+					[end]: { id: end, index: end, x: 0.1, y: 0.1 },
+				},
+				scale: 1,
+			}
+		}
+		case 'image':
+			return {
+				w: 100,
+				h: 100,
+				assetId: null,
+				playing: true,
+				url: '',
+				crop: null,
+				flipX: false,
+				flipY: false,
+				altText: '',
+			}
+		case 'video':
+			return {
+				w: 100,
+				h: 100,
+				assetId: null,
+				autoplay: true,
+				url: '',
+				altText: '',
+				time: 0,
+				playing: true,
+			}
+		case 'bookmark':
+			return { url: '', w: 300, h: 320, assetId: null }
+		case 'embed':
+			return { w: 300, h: 300, url: '' }
+		default:
+			throw new Error(`Unsupported shape type: ${type}`)
+	}
+}
+
+function richTextArgsForGeneric(args) {
+	return {
+		label: args.text,
+		bold: args.bold,
+		italic: args.italic,
+		bulletList: args.bulletList,
+		highlight: args.highlight,
+	}
+}
+
 function enumValue(name, value, allowed) {
 	if (value === undefined) return undefined
 	if (!allowed.has(value)) throw new Error(`Invalid ${name}: ${value}`)
@@ -292,6 +415,15 @@ function nextIndex(targetPageId) {
 	const { shapes } = pageShapesAndBindings(targetPageId)
 	if (!shapes.length) return 'a1'
 	const last = shapes.map((s) => s.index).sort().at(-1)
+	return getIndexAbove(last)
+}
+
+function nextIndexForParent(parentId) {
+	const siblings = store.allRecords().filter(
+		(record) => record.typeName === 'shape' && record.parentId === parentId,
+	)
+	if (!siblings.length) return 'a1'
+	const last = siblings.map((shape) => shape.index).sort().at(-1)
 	return getIndexAbove(last)
 }
 
@@ -511,6 +643,196 @@ function topologyView({ page_id }) {
 	}
 }
 
+
+function resolveShapeParent(targetPageId, requestedParentId) {
+	if (requestedParentId === undefined || requestedParentId === null || requestedParentId === '') {
+		return targetPageId
+	}
+	if (requestedParentId.startsWith('page:')) {
+		if (requestedParentId !== targetPageId) {
+			throw new Error(`Parent page must equal page_id: ${requestedParentId} !== ${targetPageId}`)
+		}
+		pageRecordById(requestedParentId)
+		return requestedParentId
+	}
+	const parent = shapeById(requestedParentId)
+	const parentPageId = pageIdForShape(parent)
+	if (parentPageId !== targetPageId) {
+		throw new Error(`Parent shape belongs to a different page: ${parentPageId}`)
+	}
+	return parent.id
+}
+
+function shapePreview(shape) {
+	const richText = shape.props?.richText
+	return {
+		id: shape.id,
+		type: shape.type,
+		pageId: pageIdForShape(shape),
+		parentId: shape.parentId,
+		index: shape.index,
+		x: shape.x,
+		y: shape.y,
+		rotation: shape.rotation ?? 0,
+		opacity: shape.opacity ?? 1,
+		isLocked: shape.isLocked ?? false,
+		text: richText ? plainText(richText) : undefined,
+		name: typeof shape.props?.name === 'string' ? shape.props.name : undefined,
+		url: typeof shape.props?.url === 'string' ? shape.props.url : undefined,
+	}
+}
+
+function shapeListView({ page_id, types }) {
+	const targetPageId = resolvePageId(page_id)
+	const page = pageRecordById(targetPageId)
+	const typeFilter = Array.isArray(types) && types.length ? new Set(types) : null
+	const { shapes } = pageShapesAndBindings(targetPageId)
+	return {
+		revision,
+		page: { id: page.id, name: page.name, index: page.index },
+		shapes: shapes
+			.filter((shape) => !typeFilter || typeFilter.has(shape.type))
+			.map(shapePreview),
+		url: CANVAS_URL,
+	}
+}
+
+function shapeGetView({ id }) {
+	const shape = shapeById(id)
+	const targetPageId = pageIdForShape(shape)
+	return {
+		revision,
+		pageId: targetPageId,
+		shape,
+		textFormat: shape.props?.richText ? textFormatSummary(shape.props.richText) : null,
+		url: CANVAS_URL,
+	}
+}
+
+function genericRichTextPatch(baseProps, args) {
+	const richArgs = richTextArgsForGeneric(args)
+	if (!richTextEditRequested(richArgs)) return baseProps
+	if (!('richText' in baseProps)) {
+		throw new Error('This shape type does not support rich text')
+	}
+	return {
+		...baseProps,
+		richText: transformRichText(baseProps.richText, richArgs),
+	}
+}
+
+async function addShape(args) {
+	const {
+		page_id,
+		type,
+		x = 100,
+		y = 100,
+		rotation = 0,
+		opacity = 1,
+		is_locked = false,
+		parent_id,
+		props = {},
+		meta = {},
+	} = args
+	const targetPageId = resolvePageId(page_id)
+	if (!DEFAULT_SHAPE_TYPES.has(type)) throw new Error(`Unsupported shape type: ${type}`)
+	const parentId = resolveShapeParent(targetPageId, parent_id)
+	const baseProps = { ...defaultPropsForShape(type), ...props }
+	const finalProps = genericRichTextPatch(baseProps, args)
+	const id = createShapeId(`${type}-${randomUUID()}`)
+	const record = store.schema.types.shape.create({
+		id,
+		type,
+		parentId,
+		index: nextIndexForParent(parentId),
+		x: finiteNumber('x', x),
+		y: finiteNumber('y', y),
+		rotation: finiteNumber('rotation', rotation),
+		opacity: unitInterval('opacity', opacity),
+		isLocked: !!is_locked,
+		props: finalProps,
+		meta,
+	})
+	store.schema.types.shape.validate(record)
+	await commitUnsafe({ added: [record] })
+	return { id, type, pageId: targetPageId, parentId, revision }
+}
+
+async function updateShape(args) {
+	const { id, props = {}, meta } = args
+	const shape = shapeById(id)
+	const targetPageId = pageIdForShape(shape)
+	const mergedProps = genericRichTextPatch({ ...shape.props, ...props }, args)
+	const next = {
+		...shape,
+		...(args.x === undefined ? {} : { x: finiteNumber('x', args.x) }),
+		...(args.y === undefined ? {} : { y: finiteNumber('y', args.y) }),
+		...(args.rotation === undefined ? {} : { rotation: finiteNumber('rotation', args.rotation) }),
+		...(args.opacity === undefined ? {} : { opacity: unitInterval('opacity', args.opacity) }),
+		...(args.is_locked === undefined ? {} : { isLocked: !!args.is_locked }),
+		...(meta === undefined ? {} : { meta: { ...shape.meta, ...meta } }),
+		props: mergedProps,
+	}
+	store.schema.types.shape.validate(next, shape)
+	await commitUnsafe({ updated: [next] })
+	return { id: shape.id, type: shape.type, pageId: targetPageId, revision }
+}
+
+function descendantShapeIds(rootId) {
+	const allShapes = store.allRecords().filter((record) => record.typeName === 'shape')
+	const childrenByParent = new Map()
+	for (const shape of allShapes) {
+		const list = childrenByParent.get(shape.parentId) ?? []
+		list.push(shape.id)
+		childrenByParent.set(shape.parentId, list)
+	}
+	const result = new Set([rootId])
+	const queue = [rootId]
+	while (queue.length) {
+		const parentId = queue.shift()
+		for (const childId of childrenByParent.get(parentId) ?? []) {
+			if (result.has(childId)) continue
+			result.add(childId)
+			queue.push(childId)
+		}
+	}
+	return result
+}
+
+async function deleteShape({ id }) {
+	const shape = shapeById(id)
+	const targetPageId = pageIdForShape(shape)
+	const shapeIds = descendantShapeIds(shape.id)
+	const records = store.allRecords()
+	const allBindings = records.filter((record) => record.typeName === 'binding')
+	const allShapesById = new Map(
+		records.filter((record) => record.typeName === 'shape').map((record) => [record.id, record]),
+	)
+
+	const connectedArrowIds = new Set()
+	for (const binding of allBindings) {
+		if (shapeIds.has(binding.toId) && allShapesById.get(binding.fromId)?.type === 'arrow') {
+			connectedArrowIds.add(binding.fromId)
+		}
+	}
+	for (const arrowId of connectedArrowIds) shapeIds.add(arrowId)
+
+	const bindingIds = allBindings
+		.filter((binding) => shapeIds.has(binding.fromId) || shapeIds.has(binding.toId))
+		.map((binding) => binding.id)
+
+	const removed = [...new Set([...shapeIds, ...bindingIds])]
+	await commitUnsafe({ removed })
+	return {
+		id: shape.id,
+		type: shape.type,
+		pageId: targetPageId,
+		removedShapeCount: shapeIds.size,
+		removedBindingCount: bindingIds.length,
+		revision,
+	}
+}
+
 async function addNode(args) {
 	const {
 		label, page_id, x = 100, y = 100, w = 240, h = 100,
@@ -674,8 +996,19 @@ async function topologyCommand(name, args = {}) {
 		await mutationTail
 		return pageListView()
 	}
+	if (name === 'shape_list') {
+		await mutationTail
+		return shapeListView(args)
+	}
+	if (name === 'shape_get') {
+		await mutationTail
+		return shapeGetView(args)
+	}
 	return serializeMutation(async () => {
 		switch (name) {
+			case 'shape_add': return addShape(args)
+			case 'shape_update': return updateShape(args)
+			case 'shape_delete': return deleteShape(args)
 			case 'node_add': return addNode(args)
 			case 'node_update': return updateNode(args)
 			case 'node_delete': return deleteNode(args)

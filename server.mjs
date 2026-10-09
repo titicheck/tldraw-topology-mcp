@@ -25,6 +25,11 @@ const ArrowKind = z.enum(['arc', 'elbow'])
 const Arrowhead = z.enum(['arrow', 'triangle', 'square', 'dot', 'pipe', 'diamond', 'inverted', 'bar', 'none'])
 const UnitInterval = z.number().min(0).max(1)
 const Positive = z.number().positive()
+const ShapeType = z.enum([
+	'arrow', 'bookmark', 'draw', 'embed', 'frame', 'geo', 'group',
+	'highlight', 'image', 'line', 'note', 'text', 'video',
+])
+const LooseObject = z.object({}).catchall(z.unknown())
 
 const richTextFields = {
 	bold: z.boolean().optional(),
@@ -115,6 +120,63 @@ mcp.registerTool('topology_get', {
 		page_id: z.string().min(1),
 	},
 }, async (args) => textResult(await callDaemon('topology_get', args)))
+
+
+mcp.registerTool('shape_list', {
+	description: 'List shapes contained in exactly one tldraw Page. Returns compact shape summaries; use shape_get for the complete native record.',
+	inputSchema: {
+		page_id: z.string().min(1),
+		types: z.array(ShapeType).optional(),
+	},
+}, async (args) => textResult(await callDaemon('shape_list', args)))
+
+mcp.registerTool('shape_get', {
+	description: 'Read one complete native tldraw shape record and its owning Page.',
+	inputSchema: {
+		id: z.string().min(1),
+	},
+}, async (args) => textResult(await callDaemon('shape_get', args)))
+
+mcp.registerTool('shape_add', {
+	description: 'Create any built-in tldraw shape on one explicit Page using native shape props. Defaults match tldraw built-ins; props may override them.',
+	inputSchema: {
+		page_id: z.string().min(1),
+		type: ShapeType,
+		parent_id: z.string().min(1).optional(),
+		x: z.number().optional(),
+		y: z.number().optional(),
+		rotation: z.number().optional(),
+		opacity: UnitInterval.optional(),
+		is_locked: z.boolean().optional(),
+		props: LooseObject.optional(),
+		meta: LooseObject.optional(),
+		text: z.string().optional(),
+		...richTextFields,
+	},
+}, async (args) => textResult(await callDaemon('shape_add', args)))
+
+mcp.registerTool('shape_update', {
+	description: 'Patch any existing tldraw shape using its native props while preserving its type and Page ownership.',
+	inputSchema: {
+		id: z.string().min(1),
+		x: z.number().optional(),
+		y: z.number().optional(),
+		rotation: z.number().optional(),
+		opacity: UnitInterval.optional(),
+		is_locked: z.boolean().optional(),
+		props: LooseObject.optional(),
+		meta: LooseObject.optional(),
+		text: z.string().optional(),
+		...richTextFields,
+	},
+}, async (args) => textResult(await callDaemon('shape_update', args)))
+
+mcp.registerTool('shape_delete', {
+	description: 'Delete any tldraw shape. Container descendants and bindings to deleted shapes are removed atomically within the owning Page.',
+	inputSchema: {
+		id: z.string().min(1),
+	},
+}, async (args) => textResult(await callDaemon('shape_delete', args)))
 
 mcp.registerTool('node_add', {
 	description: 'Add a Geo topology node with optional full tldraw presentation styles.',
