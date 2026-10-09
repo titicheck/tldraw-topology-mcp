@@ -6,6 +6,71 @@ const DAEMON_URL = ((process.env.TLDRAW_TOPOLOGY_DAEMON_URL ?? 'http://127.0.0.1
 const rawTimeout = Number(process.env.TLDRAW_TOPOLOGY_TIMEOUT_MS ?? 10000)
 const REQUEST_TIMEOUT_MS = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 10000
 
+const Color = z.enum([
+	'black', 'grey', 'light-violet', 'violet', 'blue', 'light-blue', 'yellow',
+	'orange', 'green', 'light-green', 'light-red', 'red', 'white',
+])
+const Geo = z.enum([
+	'cloud', 'rectangle', 'ellipse', 'triangle', 'diamond', 'pentagon', 'hexagon',
+	'octagon', 'star', 'rhombus', 'rhombus-2', 'oval', 'trapezoid',
+	'arrow-right', 'arrow-left', 'arrow-up', 'arrow-down', 'x-box', 'check-box', 'heart',
+])
+const Dash = z.enum(['draw', 'solid', 'dashed', 'dotted', 'none'])
+const Fill = z.enum(['none', 'semi', 'solid', 'pattern', 'fill', 'lined-fill'])
+const Size = z.enum(['s', 'm', 'l', 'xl'])
+const Font = z.enum(['draw', 'sans', 'serif', 'mono'])
+const HorizontalAlign = z.enum(['start', 'middle', 'end'])
+const VerticalAlign = z.enum(['start', 'middle', 'end'])
+const ArrowKind = z.enum(['arc', 'elbow'])
+const Arrowhead = z.enum(['arrow', 'triangle', 'square', 'dot', 'pipe', 'diamond', 'inverted', 'bar', 'none'])
+const UnitInterval = z.number().min(0).max(1)
+const Positive = z.number().positive()
+
+const richTextFields = {
+	bold: z.boolean().optional(),
+	italic: z.boolean().optional(),
+	bulletList: z.boolean().optional(),
+	highlight: z.boolean().optional(),
+}
+
+const geoStyleFields = {
+	geo: Geo.optional(),
+	color: Color.optional(),
+	labelColor: Color.optional(),
+	fill: Fill.optional(),
+	dash: Dash.optional(),
+	size: Size.optional(),
+	font: Font.optional(),
+	align: HorizontalAlign.optional(),
+	verticalAlign: VerticalAlign.optional(),
+	opacity: UnitInterval.optional(),
+	rotation: z.number().optional(),
+	scale: Positive.optional(),
+	flipX: z.boolean().optional(),
+	flipY: z.boolean().optional(),
+	url: z.string().optional(),
+	...richTextFields,
+}
+
+const arrowStyleFields = {
+	kind: ArrowKind.optional(),
+	color: Color.optional(),
+	labelColor: Color.optional(),
+	fill: Fill.optional(),
+	dash: Dash.optional(),
+	size: Size.optional(),
+	font: Font.optional(),
+	arrowheadStart: Arrowhead.optional(),
+	arrowheadEnd: Arrowhead.optional(),
+	bend: z.number().optional(),
+	labelPosition: UnitInterval.optional(),
+	elbowMidPoint: UnitInterval.optional(),
+	opacity: UnitInterval.optional(),
+	rotation: z.number().optional(),
+	scale: Positive.optional(),
+	...richTextFields,
+}
+
 async function callDaemon(name, args = {}) {
 	const controller = new AbortController()
 	const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
@@ -45,56 +110,69 @@ mcp.registerTool('page_list', {
 }, async () => textResult(await callDaemon('page_list')))
 
 mcp.registerTool('topology_get', {
-	description: 'Read the topology contained in exactly one tldraw page.',
+	description: 'Read one tldraw page topology including full editable Geo and Arrow presentation properties.',
 	inputSchema: {
 		page_id: z.string().min(1),
 	},
 }, async (args) => textResult(await callDaemon('topology_get', args)))
 
 mcp.registerTool('node_add', {
-	description: 'Add a rectangular topology node to exactly one tldraw page.',
+	description: 'Add a Geo topology node with optional full tldraw presentation styles.',
 	inputSchema: {
 		label: z.string().min(1),
 		page_id: z.string().min(1),
-		x: z.number().optional(), y: z.number().optional(),
-		w: z.number().positive().optional(), h: z.number().positive().optional(),
+		x: z.number().optional(),
+		y: z.number().optional(),
+		w: Positive.optional(),
+		h: Positive.optional(),
+		...geoStyleFields,
 	},
 }, async (args) => textResult(await callDaemon('node_add', args)))
 
 mcp.registerTool('node_update', {
-	description: 'Update a topology node label, position, or size. The owning page is derived from the node.',
+	description: 'Update a Geo topology node geometry, shape, colors, fill, stroke, font, alignment, opacity, scale, flips, URL, or whole-label rich-text formatting.',
 	inputSchema: {
-		id: z.string().min(1), label: z.string().optional(), x: z.number().optional(), y: z.number().optional(),
-		w: z.number().positive().optional(), h: z.number().positive().optional(),
+		id: z.string().min(1),
+		label: z.string().optional(),
+		x: z.number().optional(),
+		y: z.number().optional(),
+		w: Positive.optional(),
+		h: Positive.optional(),
+		...geoStyleFields,
 	},
 }, async (args) => textResult(await callDaemon('node_update', args)))
 
 mcp.registerTool('node_delete', {
-	description: 'Delete a topology node and any directed edges connected to it. The owning page is derived from the node.',
+	description: 'Delete a topology node and any directed edges connected to it.',
 	inputSchema: { id: z.string().min(1) },
 }, async (args) => textResult(await callDaemon('node_delete', args)))
 
 mcp.registerTool('edge_add', {
-	description: 'Add a directed arrow between two topology nodes. Both endpoints must belong to the same tldraw page.',
+	description: 'Add a directed Arrow between two nodes with optional full tldraw arrow and label styles.',
 	inputSchema: {
 		from: z.string().min(1),
 		to: z.string().min(1),
 		label: z.string().optional(),
+		...arrowStyleFields,
 	},
 }, async (args) => textResult(await callDaemon('edge_add', args)))
 
 mcp.registerTool('edge_update', {
-	description: 'Update the optional label of a directed topology edge. The owning page is derived from the edge.',
-	inputSchema: { id: z.string().min(1), label: z.string() },
+	description: 'Update an Arrow label, kind, colors, fill, dash, size, font, arrowheads, bend, label position, opacity, scale, elbow midpoint, rotation, or whole-label rich-text formatting.',
+	inputSchema: {
+		id: z.string().min(1),
+		label: z.string().optional(),
+		...arrowStyleFields,
+	},
 }, async (args) => textResult(await callDaemon('edge_update', args)))
 
 mcp.registerTool('edge_delete', {
-	description: 'Delete a directed topology edge and its tldraw bindings. The owning page is derived from the edge.',
+	description: 'Delete a directed topology edge and its tldraw bindings.',
 	inputSchema: { id: z.string().min(1) },
 }, async (args) => textResult(await callDaemon('edge_delete', args)))
 
 mcp.registerTool('topology_clear', {
-	description: 'Delete topology content from exactly one tldraw page while keeping the page itself and leaving every other page unchanged.',
+	description: 'Delete topology content from exactly one tldraw page while keeping the page itself, non-topology containers, and every other page unchanged.',
 	inputSchema: {
 		page_id: z.string().min(1),
 	},

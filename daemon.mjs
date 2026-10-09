@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { Editor as TipTapEditor } from '@tiptap/core'
 import {
 	createTLStore,
 	createShapeId,
@@ -13,6 +14,7 @@ import {
 	PageRecordType,
 	TLDOCUMENT_ID,
 	getIndexAbove,
+	getTipTapDefaultExtensions,
 } from 'tldraw'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
@@ -54,6 +56,191 @@ const ARROW_DEFAULTS = {
 }
 const BINDING_DEFAULTS = {
 	normalizedAnchor: { x: 0.5, y: 0.5 }, isExact: false, isPrecise: false, snap: 'none',
+}
+
+const COLOR_VALUES = new Set([
+	'black', 'grey', 'light-violet', 'violet', 'blue', 'light-blue', 'yellow',
+	'orange', 'green', 'light-green', 'light-red', 'red', 'white',
+])
+const GEO_VALUES = new Set([
+	'cloud', 'rectangle', 'ellipse', 'triangle', 'diamond', 'pentagon', 'hexagon',
+	'octagon', 'star', 'rhombus', 'rhombus-2', 'oval', 'trapezoid',
+	'arrow-right', 'arrow-left', 'arrow-up', 'arrow-down', 'x-box', 'check-box', 'heart',
+])
+const DASH_VALUES = new Set(['draw', 'solid', 'dashed', 'dotted', 'none'])
+const FILL_VALUES = new Set(['none', 'semi', 'solid', 'pattern', 'fill', 'lined-fill'])
+const SIZE_VALUES = new Set(['s', 'm', 'l', 'xl'])
+const FONT_VALUES = new Set(['draw', 'sans', 'serif', 'mono'])
+const H_ALIGN_VALUES = new Set(['start', 'middle', 'end'])
+const V_ALIGN_VALUES = new Set(['start', 'middle', 'end'])
+const ARROW_KIND_VALUES = new Set(['arc', 'elbow'])
+const ARROWHEAD_VALUES = new Set([
+	'arrow', 'triangle', 'square', 'dot', 'pipe', 'diamond', 'inverted', 'bar', 'none',
+])
+
+function enumValue(name, value, allowed) {
+	if (value === undefined) return undefined
+	if (!allowed.has(value)) throw new Error(`Invalid ${name}: ${value}`)
+	return value
+}
+
+function finiteNumber(name, value) {
+	if (value === undefined) return undefined
+	if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} must be a finite number`)
+	return value
+}
+
+function unitInterval(name, value) {
+	const number = finiteNumber(name, value)
+	if (number === undefined) return undefined
+	if (number < 0 || number > 1) throw new Error(`${name} must be between 0 and 1`)
+	return number
+}
+
+function positiveNumber(name, value) {
+	const number = finiteNumber(name, value)
+	if (number === undefined) return undefined
+	if (number <= 0) throw new Error(`${name} must be greater than 0`)
+	return number
+}
+
+function richTextEditRequested(args) {
+	return args.label !== undefined
+		|| args.bold !== undefined
+		|| args.italic !== undefined
+		|| args.bulletList !== undefined
+		|| args.highlight !== undefined
+}
+
+function transformRichText(baseRichText, args) {
+	let richText = args.label === undefined ? baseRichText : toRichText(args.label)
+	if (!richTextEditRequested({ ...args, label: undefined })) return richText
+
+	const editor = new TipTapEditor({
+		extensions: getTipTapDefaultExtensions(),
+		enableCoreExtensions: { textDirection: false },
+		textDirection: 'auto',
+		content: richText,
+	})
+
+	try {
+		editor.commands.selectAll()
+		if (args.bold !== undefined) {
+			args.bold ? editor.commands.setBold() : editor.commands.unsetBold()
+		}
+		if (args.italic !== undefined) {
+			args.italic ? editor.commands.setItalic() : editor.commands.unsetItalic()
+		}
+		if (args.highlight !== undefined) {
+			args.highlight ? editor.commands.setHighlight() : editor.commands.unsetHighlight()
+		}
+		if (args.bulletList !== undefined) {
+			const active = editor.isActive('bulletList')
+			if (active !== args.bulletList) editor.commands.toggleBulletList()
+		}
+		return editor.getJSON()
+	} finally {
+		editor.destroy()
+	}
+}
+
+function markState(richText, markName) {
+	let total = 0
+	let marked = 0
+	const visit = (node) => {
+		if (!node || typeof node !== 'object') return
+		if (node.type === 'text' && typeof node.text === 'string' && node.text.length > 0) {
+			total += 1
+			if (node.marks?.some((mark) => mark.type === markName)) marked += 1
+		}
+		if (Array.isArray(node.content)) node.content.forEach(visit)
+	}
+	visit(richText)
+	if (total === 0 || marked === 0) return false
+	if (marked === total) return true
+	return 'mixed'
+}
+
+function bulletListState(richText) {
+	const content = Array.isArray(richText?.content) ? richText.content : []
+	const meaningful = content.filter((node) => {
+		let found = false
+		const visit = (item) => {
+			if (!item || typeof item !== 'object' || found) return
+			if (item.type === 'text' && typeof item.text === 'string' && item.text.length > 0) {
+				found = true
+				return
+			}
+			if (Array.isArray(item.content)) item.content.forEach(visit)
+		}
+		visit(node)
+		return found
+	})
+	if (meaningful.length === 0) return false
+	const listed = meaningful.filter((node) => node.type === 'bulletList').length
+	if (listed === 0) return false
+	if (listed === meaningful.length) return true
+	return 'mixed'
+}
+
+function textFormatSummary(richText) {
+	return {
+		bold: markState(richText, 'bold'),
+		italic: markState(richText, 'italic'),
+		bulletList: bulletListState(richText),
+		highlight: markState(richText, 'highlight'),
+	}
+}
+
+function geoPropsPatch(args, currentRichText) {
+	const patch = {}
+	for (const [key, value] of [
+		['geo', enumValue('geo', args.geo, GEO_VALUES)],
+		['color', enumValue('color', args.color, COLOR_VALUES)],
+		['labelColor', enumValue('labelColor', args.labelColor, COLOR_VALUES)],
+		['fill', enumValue('fill', args.fill, FILL_VALUES)],
+		['dash', enumValue('dash', args.dash, DASH_VALUES)],
+		['size', enumValue('size', args.size, SIZE_VALUES)],
+		['font', enumValue('font', args.font, FONT_VALUES)],
+		['align', enumValue('align', args.align, H_ALIGN_VALUES)],
+		['verticalAlign', enumValue('verticalAlign', args.verticalAlign, V_ALIGN_VALUES)],
+	]) {
+		if (value !== undefined) patch[key] = value
+	}
+	if (args.url !== undefined) patch.url = String(args.url)
+	if (args.flipX !== undefined) patch.flipX = !!args.flipX
+	if (args.flipY !== undefined) patch.flipY = !!args.flipY
+	const scale = positiveNumber('scale', args.scale)
+	if (scale !== undefined) patch.scale = scale
+	if (richTextEditRequested(args)) patch.richText = transformRichText(currentRichText, args)
+	return patch
+}
+
+function arrowPropsPatch(args, currentRichText) {
+	const patch = {}
+	for (const [key, value] of [
+		['kind', enumValue('kind', args.kind, ARROW_KIND_VALUES)],
+		['color', enumValue('color', args.color, COLOR_VALUES)],
+		['labelColor', enumValue('labelColor', args.labelColor, COLOR_VALUES)],
+		['fill', enumValue('fill', args.fill, FILL_VALUES)],
+		['dash', enumValue('dash', args.dash, DASH_VALUES)],
+		['size', enumValue('size', args.size, SIZE_VALUES)],
+		['font', enumValue('font', args.font, FONT_VALUES)],
+		['arrowheadStart', enumValue('arrowheadStart', args.arrowheadStart, ARROWHEAD_VALUES)],
+		['arrowheadEnd', enumValue('arrowheadEnd', args.arrowheadEnd, ARROWHEAD_VALUES)],
+	]) {
+		if (value !== undefined) patch[key] = value
+	}
+	const bend = finiteNumber('bend', args.bend)
+	if (bend !== undefined) patch.bend = bend
+	const labelPosition = unitInterval('labelPosition', args.labelPosition)
+	if (labelPosition !== undefined) patch.labelPosition = labelPosition
+	const elbowMidPoint = unitInterval('elbowMidPoint', args.elbowMidPoint)
+	if (elbowMidPoint !== undefined) patch.elbowMidPoint = elbowMidPoint
+	const scale = positiveNumber('scale', args.scale)
+	if (scale !== undefined) patch.scale = scale
+	if (richTextEditRequested(args)) patch.richText = transformRichText(currentRichText, args)
+	return patch
 }
 
 const store = createTLStore()
@@ -237,7 +424,22 @@ function topologyForPage(targetPageId) {
 		y: s.y,
 		w: s.props?.w ?? 100,
 		h: s.props?.h ?? 100,
+		rotation: s.rotation ?? 0,
+		opacity: s.opacity ?? 1,
 		geo: s.props?.geo ?? 'rectangle',
+		color: s.props?.color ?? 'black',
+		labelColor: s.props?.labelColor ?? 'black',
+		fill: s.props?.fill ?? 'none',
+		dash: s.props?.dash ?? 'draw',
+		size: s.props?.size ?? 'm',
+		font: s.props?.font ?? 'draw',
+		align: s.props?.align ?? 'middle',
+		verticalAlign: s.props?.verticalAlign ?? 'middle',
+		scale: s.props?.scale ?? 1,
+		flipX: s.props?.flipX ?? false,
+		flipY: s.props?.flipY ?? false,
+		url: s.props?.url ?? '',
+		textFormat: textFormatSummary(s.props?.richText),
 	}))
 	const edges = shapes.filter((s) => s.type === 'arrow').map((s) => {
 		const bs = bindingsForArrow(s.id)
@@ -248,6 +450,26 @@ function topologyForPage(targetPageId) {
 			from: pageShapeIds.has(start?.toId) ? start.toId : null,
 			to: pageShapeIds.has(end?.toId) ? end.toId : null,
 			label: plainText(s.props?.richText),
+			x: s.x,
+			y: s.y,
+			rotation: s.rotation ?? 0,
+			opacity: s.opacity ?? 1,
+			kind: s.props?.kind ?? 'arc',
+			color: s.props?.color ?? 'black',
+			labelColor: s.props?.labelColor ?? 'black',
+			fill: s.props?.fill ?? 'none',
+			dash: s.props?.dash ?? 'draw',
+			size: s.props?.size ?? 'm',
+			font: s.props?.font ?? 'draw',
+			arrowheadStart: s.props?.arrowheadStart ?? 'none',
+			arrowheadEnd: s.props?.arrowheadEnd ?? 'arrow',
+			bend: s.props?.bend ?? 0,
+			labelPosition: s.props?.labelPosition ?? 0.5,
+			scale: s.props?.scale ?? 1,
+			elbowMidPoint: s.props?.elbowMidPoint ?? 0.5,
+			start: s.props?.start ?? null,
+			end: s.props?.end ?? null,
+			textFormat: textFormatSummary(s.props?.richText),
 		}
 	})
 	return { nodes, edges }
@@ -289,7 +511,11 @@ function topologyView({ page_id }) {
 	}
 }
 
-async function addNode({ label, page_id, x = 100, y = 100, w = 240, h = 100 }) {
+async function addNode(args) {
+	const {
+		label, page_id, x = 100, y = 100, w = 240, h = 100,
+		rotation = 0, opacity = 1,
+	} = args
 	const targetPageId = resolvePageId(page_id)
 	const id = createShapeId(`node-${randomUUID()}`)
 	const record = store.schema.types.shape.create({
@@ -297,27 +523,37 @@ async function addNode({ label, page_id, x = 100, y = 100, w = 240, h = 100 }) {
 		type: 'geo',
 		parentId: targetPageId,
 		index: nextIndex(targetPageId),
-		x,
-		y,
-		props: { ...GEO_DEFAULTS, w, h, richText: toRichText(label) },
+		x: finiteNumber('x', x),
+		y: finiteNumber('y', y),
+		rotation: finiteNumber('rotation', rotation),
+		opacity: unitInterval('opacity', opacity),
+		props: {
+			...GEO_DEFAULTS,
+			w: positiveNumber('w', w),
+			h: positiveNumber('h', h),
+			...geoPropsPatch(args, toRichText(label)),
+		},
 	})
 	await commitUnsafe({ added: [record] })
 	return { id, pageId: targetPageId, revision }
 }
 
-async function updateNode({ id, label, x, y, w, h }) {
+async function updateNode(args) {
+	const { id } = args
 	const node = shapeById(id)
 	if (node.type !== 'geo') throw new Error(`${node.id} is not a topology node`)
 	const targetPageId = pageIdForShape(node)
 	const next = {
 		...node,
-		x: x ?? node.x,
-		y: y ?? node.y,
+		...(args.x === undefined ? {} : { x: finiteNumber('x', args.x) }),
+		...(args.y === undefined ? {} : { y: finiteNumber('y', args.y) }),
+		...(args.rotation === undefined ? {} : { rotation: finiteNumber('rotation', args.rotation) }),
+		...(args.opacity === undefined ? {} : { opacity: unitInterval('opacity', args.opacity) }),
 		props: {
 			...node.props,
-			...(w === undefined ? {} : { w }),
-			...(h === undefined ? {} : { h }),
-			...(label === undefined ? {} : { richText: toRichText(label) }),
+			...(args.w === undefined ? {} : { w: positiveNumber('w', args.w) }),
+			...(args.h === undefined ? {} : { h: positiveNumber('h', args.h) }),
+			...geoPropsPatch(args, node.props.richText),
 		},
 	}
 	await commitUnsafe({ updated: [next] })
@@ -349,7 +585,8 @@ async function deleteNode({ id }) {
 	return { id: node.id, pageId: targetPageId, removedEdges: edgeIds, revision }
 }
 
-async function addEdge({ from, to, label = '' }) {
+async function addEdge(args) {
+	const { from, to, label = '', rotation = 0, opacity = 1 } = args
 	const fromNode = shapeById(from)
 	const toNode = shapeById(to)
 	if (fromNode.type !== 'geo' || toNode.type !== 'geo') throw new Error('Edges must connect topology nodes')
@@ -369,10 +606,12 @@ async function addEdge({ from, to, label = '' }) {
 		index: nextIndex(targetPageId),
 		x: startX,
 		y: startY,
+		rotation: finiteNumber('rotation', rotation),
+		opacity: unitInterval('opacity', opacity),
 		props: {
 			...ARROW_DEFAULTS,
 			end: { x: endX - startX, y: endY - startY },
-			richText: toRichText(label),
+			...arrowPropsPatch({ ...args, label }, toRichText(label)),
 		},
 	})
 	const bindingType = store.schema.types.binding
@@ -390,11 +629,20 @@ async function addEdge({ from, to, label = '' }) {
 	return { id: edgeId, pageId: targetPageId, from: fromNode.id, to: toNode.id, revision }
 }
 
-async function updateEdge({ id, label }) {
+async function updateEdge(args) {
+	const { id } = args
 	const edge = shapeById(id)
 	if (edge.type !== 'arrow') throw new Error(`${edge.id} is not a topology edge`)
 	const targetPageId = pageIdForShape(edge)
-	const next = { ...edge, props: { ...edge.props, richText: toRichText(label) } }
+	const next = {
+		...edge,
+		...(args.rotation === undefined ? {} : { rotation: finiteNumber('rotation', args.rotation) }),
+		...(args.opacity === undefined ? {} : { opacity: unitInterval('opacity', args.opacity) }),
+		props: {
+			...edge.props,
+			...arrowPropsPatch(args, edge.props.richText),
+		},
+	}
 	await commitUnsafe({ updated: [next] })
 	return { id: edge.id, pageId: targetPageId, revision }
 }
